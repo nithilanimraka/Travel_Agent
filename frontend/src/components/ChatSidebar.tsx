@@ -1,24 +1,39 @@
 import { Button } from "@/components/ui/button";
 import { ScrollArea } from "@/components/ui/scroll-area";
 import { Separator } from "@/components/ui/separator";
+import { Skeleton } from "@/components/ui/skeleton"; // Import Skeleton
 import { 
   Plus, 
   Settings, 
   LogOut, 
   Plane,
-  Clock
+  Clock,
+  MessageSquare
 } from "lucide-react";
+
+// Define the shape of a chat history item
+interface ChatHistoryItem {
+  session_id: string;
+  title: string;
+  timestamp: string;
+}
 
 interface ChatSidebarProps {
   onNewChat: () => void;
   onLogout: () => void;
   userEmail?: string;
+  chatHistory: ChatHistoryItem[];
+  isLoadingHistory: boolean;
+  onSelectChat: (sessionId: string) => void;
 }
 
 export const ChatSidebar = ({ 
   onNewChat, 
   onLogout,
-  userEmail 
+  userEmail,
+  chatHistory,
+  isLoadingHistory,
+  onSelectChat
 }: ChatSidebarProps) => {
   return (
     <div className="w-80 bg-sidebar-bg border-r h-full flex flex-col">
@@ -44,15 +59,42 @@ export const ChatSidebar = ({
         </Button>
       </div>
 
-      {/* Chat History Section (Now empty) */}
+      {/* Chat History Section (Updated) */}
       <ScrollArea className="flex-1">
         <div className="p-4">
           <h3 className="text-sm font-medium text-muted-foreground mb-3 flex items-center gap-2">
             <Clock className="h-4 w-4" />
             Recent Chats
           </h3>
-          <div className="space-y-2 text-center text-sm text-muted-foreground mt-4">
-            <p>Your chat history will appear here in the future.</p>
+          <div className="space-y-1">
+            {isLoadingHistory ? (
+              // Loading Skeletons
+              <>
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+                <Skeleton className="h-10 w-full" />
+              </>
+            ) : chatHistory.length > 0 ? (
+              // Chat History List
+              chatHistory.map((chat) => (
+                <Button
+                  key={chat.session_id}
+                  variant="ghost"
+                  className="w-full h-auto p-2 flex items-start justify-start gap-2"
+                  onClick={() => onSelectChat(chat.session_id)}
+                >
+                  <MessageSquare className="h-4 w-4 mt-1 text-muted-foreground flex-shrink-0" />
+                  <p className="text-sm font-normal text-left truncate leading-snug">
+                    {chat.title}
+                  </p>
+                </Button>
+              ))
+            ) : (
+              // Empty State
+              <div className="text-center text-sm text-muted-foreground mt-4 px-2">
+                <p>Your previous chats will appear here.</p>
+              </div>
+            )}
           </div>
         </div>
       </ScrollArea>

@@ -11,7 +11,7 @@ import re
 from fastapi import FastAPI, HTTPException, BackgroundTasks, Request
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, List
 import uuid
 import time
 from passlib.context import CryptContext
@@ -76,6 +76,12 @@ class HumanInputRequest(BaseModel):
     session_id: str
     response: str
 
+# Add these new Pydantic models for the history response
+class ChatHistoryItem(BaseModel):
+    session_id: str
+    title: str
+    timestamp: datetime
+
 # In-memory session storage for active chats
 sessions: Dict[str, Dict[str, Any]] = {}
 
@@ -97,6 +103,59 @@ async def login(user: UserLogin):
     if not db_user or not pwd_context.verify(user.password, db_user["hashed_password"]):
         raise HTTPException(status_code=401, detail="Incorrect email or password")
     return {"message": "Login successful", "user": {"name": db_user["name"], "email": db_user["email"]}}
+
+@app.get("/chats/history/{user_email}", response_model=List[ChatHistoryItem])
+async def get_chat_history(user_email: str):
+    """
+    Retrieves the chat history for a user, grouped by session.
+    Each session is represented by its first message.
+    """
+    pipeline = [
+        # Find all messages for the given user
+        {"$match": {"user_email": user_email, "sender": "user"}},
+        # Sort messages by timestamp to find the first one in each session
+        {"$sort": {"timestamp": 1}},
+        # Group by session_id and get the first message content as the title
+        {
+            "$group": {
+                "_id": "$session_id",
+                "title": {"$first": "$content"},
+                "timestamp": {"$first": "$timestamp"}
+            }
+        },
+        # Sort the sessions themselves by the most recent
+        {"$sort": {"timestamp": -1}},
+        # Format the output
+        {
+            "$project": {
+                "session_id": "$_id",
+                "title": {"$substr": ["$title", 0, 50]}, # Truncate title for preview
+                "timestamp": 1,
+                "_id": 0
+            }
+        }
+    ]
+    history = list(chats_collection.aggregate(pipeline))
+    return history
+
+# --- NEW: Endpoint to get messages for one session ---
+@app.get("/chats/session/{session_id}")
+async def get_session_messages(session_id: str):
+    """Retrieves all messages for a specific session, sorted by time."""
+    messages_cursor = chats_collection.find(
+        {"session_id": session_id}
+    ).sort("timestamp", 1)
+    
+    messages = []
+    for msg in messages_cursor:
+        # Convert ObjectId to string for JSON serialization
+        msg["_id"] = str(msg["_id"])
+        messages.append(msg)
+
+    if not messages:
+        raise HTTPException(status_code=404, detail="Session not found")
+        
+    return messages
 
 # --- Chat Message Saving Endpoint ---
 @app.post("/chats/messages")
