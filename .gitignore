@@ -1,5 +1,6 @@
 backend/.env
 backend/myenv-crew
+backend/__pycache__
 # Logs
 frontend/logs
 frontend/*.log
