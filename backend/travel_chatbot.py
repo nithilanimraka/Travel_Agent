@@ -1,4 +1,5 @@
 import os
+from typing import Optional
 from dotenv import load_dotenv
 from functools import lru_cache
 from crewai import LLM, Agent, Task, Crew, Process
@@ -19,7 +20,7 @@ GEMINI1_API_KEY = os.getenv("GEMINI1_API_KEY")
 
 GEMINIPRO_API_KEY = os.getenv("GEMINIPRO_API_KEY")
 
-OPENROUTER_API_KEY3=os.getenv("OPENROUTER_API_KEY3")
+OPENROUTER_API_KEY2=os.getenv("OPENROUTER_API_KEY2")
 OPENAI_API_BASE=os.getenv("OPENAI_API_BASE")
 
 os.environ["SERPER_API_KEY"] = os.getenv("SERPER_API_KEY")
@@ -30,7 +31,7 @@ print("API Keys loaded successfully.")
 def initialize_llm():
     return LLM(
         model="openrouter/z-ai/glm-4.5-air:free",
-        api_key=OPENROUTER_API_KEY3,
+        api_key=OPENROUTER_API_KEY2,
         base_url=os.getenv("OPENAI_API_BASE", "https://openrouter.ai/api/v1"),
         temperature=0.4,        # lower randomness for agentic use            # enable streaming if helpful
     )
@@ -450,12 +451,21 @@ def extract_json_from_response(response_text: str) -> dict:
         print(f"Attempted to parse: {cleaned_text}")
         raise        
 
-def create_setup_crew(initial_prompt: str):
+def create_setup_crew(initial_prompt: str, conversation_history=None):
     """Creates the crew responsible for gathering user requirements."""
     llmpro = initialize_llmPro() # Use a fast and reliable LLM for conversation
 
     current_date = datetime.now().strftime('%Y-%m-%d')
 
+    # Format conversation history for inclusion in the task description
+    history_text = ""
+    if conversation_history:
+        history_items = []
+        for item in conversation_history:
+            history_items.append(f"Question: {item['question']}")
+            history_items.append(f"Answer: {item['response']}")
+        history_text = "\n".join(history_items)
+    
     # This agent's job is to talk to the user and fill out a form.
     setup_agent = Agent(
         role="Trip Requirements Specialist",
@@ -463,7 +473,9 @@ def create_setup_crew(initial_prompt: str):
              "Your final goal is to produce a JSON object with all the required information.",
         backstory="You are a friendly and efficient assistant who helps users plan their "
                   "dream vacation. You are programmed to ask clarifying questions one by one "
-                  "until you have all the information needed to create a travel plan.",
+                  "until you have all the information needed to create a travel plan. "
+                  "You carefully track all information provided by the user and never ask "
+                  "for information that has already been provided.",
         tools=[human_input_tool],
         llm=llmpro,
         verbose=False
@@ -478,6 +490,9 @@ def create_setup_crew(initial_prompt: str):
         **CRITICAL: You must start by analyzing the initial user prompt and extracting ALL available information BEFORE asking any questions.**
 
         **Initial User Prompt:** "{initial_prompt}"
+
+        **CONVERSATION HISTORY:**
+        {history_text}
 
         **STEP 1 - ANALYZE AND EXTRACT (DO THIS FIRST):**
         Carefully read the initial prompt above and extract information to pre-fill this JSON:
@@ -518,6 +533,12 @@ def create_setup_crew(initial_prompt: str):
         **STEP 2 - ASK FOR MISSING INFO ONLY:**
         After pre-filling from the prompt, follow these rules:
         
+        **IMPORTANT STATE MANAGEMENT:**
+        - After extracting information from the initial prompt, create a mental checklist of what you have vs. what you need.
+        - ONLY ask for information that is still missing (still "null").
+        - After each user response, update your checklist BEFORE deciding what to ask next.
+        - NEVER ask for information that has already been provided in the initial prompt or in a previous response.
+
         - **For budget**: If still "null", ask the user for their budget
         - **For travel_dates**: If still "null", ask the user: "What are your preferred travel dates? (You can say 'flexible' if you don't have specific dates)"
           
@@ -538,7 +559,9 @@ def create_setup_crew(initial_prompt: str):
           * Canada → "CAD"
           * Singapore → "SGD"
           * Default to "USD" if country not recognized
-        
+
+        - **For num_people**: If still "null", ask the user: "How many people will be traveling?"
+
         Ask one question at a time using the Human Input Tool. Skip asking about preferred_currency entirely.
 
         **STEP 3 - FINAL OUTPUT FORMAT:**
@@ -568,7 +591,7 @@ def create_setup_crew(initial_prompt: str):
         verbose=False
     )
 
-def invoke_agent(location, interests, budget, num_people, travel_dates, preferred_currency):
+def invoke_agent(location, interests, budget, num_people, travel_dates, preferred_currency, chat_history: Optional[str] = None):
     """Invokes the travel agent with the given inputs."""
 
     budget_in_usd = float('inf') # Default to infinite budget if flexible
@@ -615,7 +638,18 @@ def invoke_agent(location, interests, budget, num_people, travel_dates, preferre
     llm_model = initialize_llm()
     llm1_model = initialize_llm1()
 
-
+    # --- History context for the agents ---
+    history_context = ""
+    if chat_history:
+        history_context = f"""
+        **IMPORTANT CONTEXT FROM PREVIOUS TURN:**
+        The user has already received a travel plan. You are now in a follow-up conversation.
+        Here is the summary of the last interaction:
+        ---
+        {chat_history}
+        ---
+        Use this history to understand the user's new request. For example, if they ask to "change the hotel," you know to find a new hotel while keeping other details the same. If they ask for "more options," provide alternatives to what was previously suggested.
+        """
 
     # Agent 1: Local Data Agent
     local_data_agent = Agent(
@@ -667,6 +701,7 @@ def invoke_agent(location, interests, budget, num_people, travel_dates, preferre
     task_get_local_data = Task(
         description=f"""Fetch the currency conversion rate from USD to the local currency for {location}.
         {weather_tool_usage_instruction}
+        {history_context}
         """,
         expected_output="A summary of the weather forecast for the specified dates and the USD to local currency conversion rate.",
         agent=local_data_agent
@@ -682,11 +717,25 @@ def invoke_agent(location, interests, budget, num_people, travel_dates, preferre
         {budget_instruction}
         {accommodation_instruction}
 
+        {history_context}
+
         **IMPORTANT CONTEXT USAGE:** You will receive context from a data specialist that includes a real-time currency conversion rate. If you find prices online in a local currency (e.g., INR, LKR), you **must use the precise conversion rate provided in your context** to convert them to USD for your analysis and final JSON output. This is more accurate than using your general knowledge.
 
-        **CRITICAL INSTRUCTION**: For each item you research (especially accommodation, restaurants, and specific activities), you MUST use the search tool to find a relevant webpage (like a booking page, official website, or Google Maps link) and include it in the 'link' field of your JSON output. If no direct link is available, you can set the value to "null".
-        The TOTAL estimated cost of all researched items (in USD) must not exceed this budget and also should be close to this budget.
+        **CRITICAL BUDGET INSTRUCTION**: Your goal is to create a plan that utilizes AT LEAST 80-90% of the available budget. Do not suggest the cheapest options just to stay under budget. Instead, recommend better quality accommodations, dining experiences, and activities that provide more value while still staying within the budget limit. The total estimated cost should be close to but not exceed the budget.
+        Eg: If the user's budget is 200 USD, PROVIDE the total_estimated_cost_usd NOT LESS THAN 160 USD and NOT GREATER THAN 200 USD.
 
+        **CRITICAL INSTRUCTION FOR LINKS**: For EVERY item you research (accommodation, restaurants, activities, etc.), you MUST:
+        1. Find SPECIFIC, NAMED establishments (not generic "local restaurant")
+        2. Use the search tool to find a relevant webpage (booking page, official website, or Google Maps link)
+        3. Include the exact URL in the 'link' field of your JSON output
+        4. Only set 'link' to "null" if absolutely no online information can be found
+
+        **CRITICAL** ANY RESTAURANT THAT HAS A LINK MUST INCLUDE A LINK IN YOUR FINAL JSON OUTPUT.
+    
+        For dining recommendations, you must find specific restaurants with names, addresses, and links to their information (Google Maps, official website, or review pages).
+    
+        **IMPORTANT**: The TOTAL estimated cost of all researched items (in USD) must not exceed this budget and should be between 80-90% of the total budget.
+    
         **Your instructions are to be highly efficient. Aim to use the web search tool no more than 2-3 times.**
 
         Your research output MUST contain the following specific items:
@@ -707,8 +756,17 @@ def invoke_agent(location, interests, budget, num_people, travel_dates, preferre
     task_verify_budget = Task(
         description=f"""Analyze the research from the city expert.
         {budget_instruction}
-        Sum up the total estimated cost of ALL items (activities and accommodation) provided by the researcher.Compare this total to the available USD budget. Provide a clear 'go' or 'no-go' verdict with a brief justification. The user's original budget was '{budget_in_usd}'.""",
-        expected_output="A budget feasibility verdict (Go/No-Go) comparing the total estimated cost in USD against the total available budget in USD.",
+        Calculate what 80% of the budget would be (0.8 * {budget_in_usd} = {0.8 * budget_in_usd} USD).
+    
+        Sum up the total estimated cost of ALL items (activities and accommodation) provided by the researcher.
+        
+        Provide a verdict based on these criteria:
+        1. If the total cost exceeds the budget: "No-Go - Over budget"
+        2. If the total cost is less than 80% of the budget: "No-Go - Too far under budget. The plan should utilize at least 80% of the available budget."
+        3. If the total cost is between 80-100% of the budget: "Go - Budget utilization is appropriate"
+        
+        Include a brief justification with your verdict, showing the budget, and actual total cost. The user's original budget was '{budget_in_usd}' USD.""",
+        expected_output="A budget feasibility verdict (Go/No-Go) comparing the total estimated cost in USD against the total available budget in USD, with specific feedback on budget utilization.",
         agent=budget_verifier_agent,
         context=[task_find_city_info]
     )
@@ -734,8 +792,9 @@ def invoke_agent(location, interests, budget, num_people, travel_dates, preferre
             c. Format the result as "X,XXX.XX {target_currency}" (with appropriate decimal places)
             d. **When displaying the cost, show ONLY the final converted amount. Do NOT show the original USD cost or the mathematical calculation used to arrive at the final price.**
                For example, instead of writing "Cost: 100 USD x 301.95 = 30,195 LKR", you MUST write "Cost: 30,195 LKR"..
-            e. **If the item has a 'link' that is not "null", you MUST format it as a clickable markdown link.**
-               For example, if the name is "Mirissa Beach Villa" and the link is "https://example.com/villa", you must provide the clickable link near the name.
+            e. **CRITICAL LINK HANDLING**: 
+               - If the item has a 'link' that is not "null", you MUST format it as a clickable markdown link.
+               - For example, if the name is "Mirissa Beach Villa" and the link is "https://example.com/villa", you must provide the clickable link near the name.
         5.  For every activity/ meal (eg: breakfast, lunch, dunner)/  scenary or literally anything, **YOU MUST mention the cost if the user has to pay for it**.   
         6.  Synthesize the parsed items into a cohesive, daily plan.
         7.  **Important:** Do NOT display the 'USD to {target_currency}' conversion rate in the report if the user's original budget was already provided in {target_currency}. Only show the conversion rate if the original budget currency was different from the final report currency.
@@ -743,7 +802,10 @@ def invoke_agent(location, interests, budget, num_people, travel_dates, preferre
         9.  Include the weather insights if available. If specific weather data was fetched, incorporate it. If dates are flexible, provide seasonal recommendations instead.
         10.  At the end of the report, give a budget summary of the total cost of the trip in {target_currency}.
         11.  Format the entire output as a beautiful and exciting markdown report. Display all final costs ONLY in {target_currency}.
+
+        **VERY IMPORTANT: DO NOT PROVIDE THE CONVERSION RATE IN THE REPORT.**
         """,
+
         expected_output=f"A complete, beautifully formatted markdown report with a travel plan, budget analysis, and weather/seasonal insights. All costs must be in {target_currency} and must not show any calculations.",
         agent=travel_concierge_agent,
         context=[task_verify_budget, task_get_local_data, task_find_city_info]

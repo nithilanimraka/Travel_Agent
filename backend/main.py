@@ -168,35 +168,108 @@ async def save_chat_message(message: ChatMessage):
 # --- Background Crew Task ---
 def run_crew_task(session_id: str, initial_prompt: str):
     try:
+        # Create a more robust human input function for this session
         def get_human_input_for_session(question: str) -> str:
+            # Store the question and set status to awaiting input
             sessions[session_id]["pending_input"] = question
             sessions[session_id]["status"] = "awaiting_input"
+            
+            # Wait for the frontend to provide a response
+            timeout = 300  # 5 minutes timeout
+            start_time = time.time()
+            
             while sessions[session_id].get("human_response") is None:
                 time.sleep(1)
+                # Check for timeout
+                if time.time() - start_time > timeout:
+                    sessions[session_id]["status"] = "error"
+                    sessions[session_id]["error"] = "Input timeout"
+                    return "Timeout - no response received"
+            
+            # Get the response and clean up
             response = sessions[session_id].pop("human_response")
             sessions[session_id]["pending_input"] = None
             sessions[session_id]["status"] = "in_progress"
+            
+            # Store the question and response in session history
+            if "conversation_history" not in sessions[session_id]:
+                sessions[session_id]["conversation_history"] = []
+            
+            sessions[session_id]["conversation_history"].append({
+                "question": question,
+                "response": response,
+                "timestamp": datetime.utcnow()
+            })
+            
             return response
-
-        human_input_tool.func = get_human_input_for_session
-        setup_crew = create_setup_crew(initial_prompt)
-        sessions[session_id]["status"] = "in_progress"
-        trip_details_output = setup_crew.kickoff()
-        trip_details = extract_json_from_response(trip_details_output.raw)
-        sessions[session_id]["trip_details"] = trip_details
-        sessions[session_id]["status"] = "setup_complete"
         
-        result_object = invoke_agent(**trip_details)
+        # Replace the human_input_tool function with our session-specific one
+        human_input_tool.func = get_human_input_for_session
+        
+        # Initialize session state if needed
+        if "conversation_history" not in sessions[session_id]:
+            sessions[session_id]["conversation_history"] = []
+        
+        # Check if we are in the middle of a conversation
+        if sessions[session_id].get("trip_details"):
+            trip_details = sessions[session_id]["trip_details"]
+            
+            # Construct a comprehensive chat history
+            history_items = []
+            for item in sessions[session_id].get("conversation_history", []):
+                history_items.append(f"Question: {item['question']}")
+                history_items.append(f"Answer: {item['response']}")
+            
+            history_text = "\n".join(history_items)
+            
+            chat_history = f"""
+            Previous conversation:
+            {history_text}
+            
+            Previous trip details:
+            Location: {trip_details.get('location', 'Not specified')}
+            Interests: {trip_details.get('interests', 'Not specified')}
+            Budget: {trip_details.get('budget', 'Not specified')}
+            Number of people: {trip_details.get('num_people', 'Not specified')}
+            Travel dates: {trip_details.get('travel_dates', 'Not specified')}
+            Preferred currency: {trip_details.get('preferred_currency', 'Not specified')}
+            
+            Previous agent response: {sessions[session_id].get('result', 'No previous response.')}
+            
+            Current user request: {initial_prompt}
+            """
+            
+            # Update the interests with the new prompt to reflect the latest request
+            trip_details["interests"] = initial_prompt
+            
+            # Invoke the agent with history
+            result_object = invoke_agent(chat_history=chat_history, **trip_details)
+        else:
+            # This is the first message in the session, so run the setup crew
+            # Pass the conversation history to the setup crew
+            conversation_history = sessions[session_id].get("conversation_history", [])
+            setup_crew = create_setup_crew(initial_prompt, conversation_history)
+            sessions[session_id]["status"] = "in_progress"
+            
+            # Store the full initial prompt for future reference
+            sessions[session_id]["full_initial_prompt"] = initial_prompt 
+            
+            trip_details_output = setup_crew.kickoff()
+            trip_details = extract_json_from_response(trip_details_output.raw)
+            sessions[session_id]["trip_details"] = trip_details
+            sessions[session_id]["status"] = "setup_complete"
+            
+            # Invoke the agent without history for the first time
+            result_object = invoke_agent(**trip_details)
+        
         raw_result = result_object.raw if hasattr(result_object, 'raw') else str(result_object)
-
-        # --- THIS IS THE FIX ---
+        
         # Clean the raw markdown output to remove code fences
         cleaned_result = re.sub(r'^```markdown\n', '', raw_result)
         cleaned_result = re.sub(r'```$', '', cleaned_result)
         cleaned_result = cleaned_result.strip()
-        # --- END OF FIX ---
-
-        sessions[session_id]["result"] = cleaned_result # Store the cleaned result
+        
+        sessions[session_id]["result"] = cleaned_result
         sessions[session_id]["status"] = "completed"
         
     except Exception as e:
@@ -209,9 +282,43 @@ def run_crew_task(session_id: str, initial_prompt: str):
 # --- Chatbot Core Endpoints ---
 @app.post("/chatbot/start", response_model=ChatbotResponse)
 async def start_chatbot(request: ChatbotRequest, background_tasks: BackgroundTasks):
-    session_id = request.session_id if request.session_id else str(uuid.uuid4())
+    # Check if we have a session_id in the request
+    session_id = request.session_id
+    
+    # If no session_id is provided, try to find an existing session for this user
+    if not session_id:
+        # Try to find a recent session with similar initial prompt
+        # This is a fallback mechanism in case the frontend doesn't send the session_id
+        user_prompt = request.prompt.lower()
+        for sid, session in sessions.items():
+            if session.get("status") in ["completed", "setup_complete"]:
+                initial_prompt = session.get("initial_prompt", "").lower()
+                # If the initial prompt contains similar keywords, consider it the same conversation
+                if any(keyword in initial_prompt for keyword in user_prompt.split() if len(keyword) > 3):
+                    session_id = sid
+                    break
+        
+        # If no matching session found, create a new one
+        if not session_id:
+            session_id = str(uuid.uuid4())
+    
+    # Initialize the session if it doesn't exist
     if session_id not in sessions:
-        sessions[session_id] = {"status": "initializing", "initial_prompt": request.prompt}
+        sessions[session_id] = {
+            "status": "initializing",
+            "initial_prompt": request.prompt,
+            "conversation_history": [],
+            "trip_details": None,
+            "pending_input": None,
+            "human_response": None,
+            "result": None,
+            "error": None,
+            "last_activity": datetime.utcnow()
+        }
+    else:
+        # Update the last activity timestamp
+        sessions[session_id]["last_activity"] = datetime.utcnow()
+    
     background_tasks.add_task(run_crew_task, session_id, request.prompt)
     return ChatbotResponse(session_id=session_id, status="in_progress", message="Chatbot processing started.")
 
