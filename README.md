@@ -33,8 +33,8 @@ Follow these steps to set up both the backend and frontend services.
 First, clone this repository to your local machine.
 
 ```bash
-git clone https://github.com/your-username/travel-agent.git
-cd travel-agent
+git clone https://github.com/nithilanimraka/Travel_Agent
+cd Travel_Agent
 ```
 
 #### 2. Backend Setup
